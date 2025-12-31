@@ -36,3 +36,4 @@ HIDDEN_TRUTH = "THEY_ARE_REPLACING_US_ONE_BY_ONE"
 VIDEO_RES = (1280, 720)
 FPS = 24
 FONT_PATH = "assets/vcr.ttf"  # User needs to drop a font here, or it defaults
+
