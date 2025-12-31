@@ -1,223 +1,240 @@
-# scraper.py
+"""
+scraper.py
+- Scrape public-domain / openly-licensed images (Wikimedia Commons) based on randomized keywords.
+- Also pulls one "normal" RSS headline (for the weird element).
+"""
 from __future__ import annotations
 
 import os
-import random
 import re
+import time
+import random
+import hashlib
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-import feedparser
 import requests
-
-USER_AGENT = "AnalogHorrorBot/1.0 (GitHub Actions; contact: none)"
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": USER_AGENT})
+from bs4 import BeautifulSoup
+import feedparser
 
 
-KEYWORDS = [
-    "liminal space hallway",
-    "abandoned office 1990s",
-    "crt monitor closeup",
-    "vhs cassette label",
-    "dial-up modem",
-    "computer lab 1990s",
-    "fluorescent corridor",
-    "empty mall interior",
-    "security camera still",
-    "analog television static",
-    "office cubicles night",
-    "stairwell institutional",
+WIKI_API = "https://commons.wikimedia.org/w/api.php"
+UA = "AnalogHorrorBot/1.0 (GitHub Actions; educational)"
+
+
+KEYWORDS_LIMINAL = [
+    "liminal space", "empty hallway", "abandoned office", "fluorescent corridor",
+    "empty mall", "backrooms", "night school corridor", "waiting room", "motel hallway",
+    "carpet pattern", "stairwell", "utility room"
+]
+KEYWORDS_TECH_90S = [
+    "CRT monitor", "camcorder", "VHS tape", "dial-up modem", "computer lab 1990s",
+    "server room", "fax machine", "floppy disk", "dot matrix printer", "cathode ray",
+    "answering machine"
+]
+KEYWORDS_CREEPY = [
+    "fog", "abandoned", "ruins", "warning sign", "surveillance camera", "emergency exit",
+    "maintenance", "electrical room", "hospital corridor"
 ]
 
-RSS_FEEDS = [
+RSS_SOURCES = [
     "https://feeds.bbci.co.uk/news/rss.xml",
     "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
     "https://www.theguardian.com/world/rss",
+    "https://www.reuters.com/rssFeed/topNews",
 ]
 
 
 @dataclass
-class ImageAsset:
-    url: str
-    source: str
-    title: str
-    license_hint: str = ""
+class ScrapeConfig:
+    out_dir: str
+    max_images: int = 14
+    min_width: int = 960
+    min_height: int = 720
+    allow_extensions: Tuple[str, ...] = (".jpg", ".jpeg", ".png")
+    seed: Optional[int] = None
 
 
-def pick_keyword(seed: Optional[int] = None) -> str:
-    rnd = random.Random(seed)
-    return rnd.choice(KEYWORDS)
+def pick_keywords(seed: Optional[int] = None) -> List[str]:
+    rng = random.Random(seed)
+    pools = [KEYWORDS_LIMINAL, KEYWORDS_TECH_90S, KEYWORDS_CREEPY]
+    kws = []
+    for _ in range(rng.randint(2, 4)):
+        x = rng.random()
+        if x < 0.45:
+            kws.append(rng.choice(pools[0]))
+        elif x < 0.80:
+            kws.append(rng.choice(pools[1]))
+        else:
+            kws.append(rng.choice(pools[2]))
+    if rng.random() < 0.5:
+        kws.append(rng.choice(["archive", "photograph", "1990", "security", "empty"]))
+    out = []
+    for k in kws:
+        if k not in out:
+            out.append(k)
+    return out
 
 
-def _commons_search_files(query: str, limit: int = 12) -> List[str]:
-    """
-    Returns Commons file titles (e.g., 'File:Something.jpg') by searching.
-    Uses MediaWiki API generator=search in namespace 6 (File).
-    """
-    api = "https://commons.wikimedia.org/w/api.php"
+def _safe_filename(s: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9_\-\.]+", "_", s)
+    return s[:120].strip("_") or "image"
+
+
+def _download(url: str, dst: str, timeout: int = 35) -> bool:
+    try:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": UA}, stream=True)
+        r.raise_for_status()
+        with open(dst, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    f.write(chunk)
+        return os.path.getsize(dst) > 10_000
+    except Exception:
+        return False
+
+
+def _wikimedia_search_images(query: str, limit: int, rng: random.Random) -> List[dict]:
     params = {
         "action": "query",
         "format": "json",
         "generator": "search",
-        "gsrnamespace": 6,
-        "gsrsearch": query,
-        "gsrlimit": limit,
-        "origin": "*",
-    }
-    r = SESSION.get(api, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    pages = (data.get("query") or {}).get("pages") or {}
-    titles = []
-    for _, p in pages.items():
-        t = p.get("title")
-        if t and t.lower().startswith("file:"):
-            titles.append(t)
-    return titles
-
-
-def _commons_file_info(file_title: str, thumb_px: int = 1600) -> Optional[ImageAsset]:
-    """
-    Fetches imageinfo + extmetadata to try to prefer Public Domain / CC0.
-    Returns a direct URL (thumb) that is easy to download.
-    """
-    api = "https://commons.wikimedia.org/w/api.php"
-    params = {
-        "action": "query",
-        "format": "json",
-        "titles": file_title,
+        "gsrsearch": f"filetype:bitmap {query}",
+        "gsrlimit": str(limit),
         "prop": "imageinfo",
-        "iiprop": "url|extmetadata",
-        "iiurlwidth": thumb_px,
-        "origin": "*",
+        "iiprop": "url|size|mime",
+        "iiurlwidth": "1600",
     }
-    r = SESSION.get(api, params=params, timeout=30)
+    r = requests.get(WIKI_API, params=params, headers={"User-Agent": UA}, timeout=35)
     r.raise_for_status()
     data = r.json()
-    pages = (data.get("query") or {}).get("pages") or {}
-    for _, p in pages.items():
-        iis = p.get("imageinfo") or []
+    pages = (data.get("query", {}) or {}).get("pages", {}) or {}
+    results = []
+    for _pid, page in pages.items():
+        iis = (page.get("imageinfo") or [])
         if not iis:
             continue
         ii = iis[0]
-        thumb = ii.get("thumburl") or ii.get("url")
-        meta = ii.get("extmetadata") or {}
-        lic_short = (meta.get("LicenseShortName") or {}).get("value", "")
-        lic_url = (meta.get("LicenseUrl") or {}).get("value", "")
-        artist = (meta.get("Artist") or {}).get("value", "")
-        title = (meta.get("ObjectName") or {}).get("value", file_title)
-
-        license_hint = " ".join([lic_short, lic_url]).strip()
-
-        # Heuristic: prefer PD / CC0 (not bulletproof).
-        ok = False
-        l = (lic_short or "").lower()
-        if "public domain" in l or "cc0" in l or "pd" == l.strip():
-            ok = True
-
-        # Still allow if no metadata (Commons thumbnails are usually safe to fetch,
-        # but licensing may vary; you can tighten this if needed).
-        if ok or not lic_short:
-            clean_title = re.sub(r"<.*?>", "", title).strip()
-            clean_artist = re.sub(r"<.*?>", "", artist).strip()
-            return ImageAsset(
-                url=thumb,
-                source="Wikimedia Commons",
-                title=f"{clean_title} — {clean_artist}".strip(" —"),
-                license_hint=license_hint,
-            )
-    return None
+        url = ii.get("url")
+        if not url:
+            continue
+        results.append({
+            "title": page.get("title", ""),
+            "url": url,
+            "width": ii.get("width", 0),
+            "height": ii.get("height", 0),
+            "mime": ii.get("mime", ""),
+        })
+    rng.shuffle(results)
+    return results
 
 
-def fetch_commons_images(query: str, max_images: int = 6) -> List[ImageAsset]:
-    titles = _commons_search_files(query, limit=max_images * 3)
-    random.shuffle(titles)
-
-    out: List[ImageAsset] = []
-    for t in titles:
-        asset = _commons_file_info(t)
-        if asset and asset.url:
-            out.append(asset)
-        if len(out) >= max_images:
-            break
-    return out
-
-
-def fetch_archive_images(query: str, max_images: int = 4) -> List[ImageAsset]:
-    """
-    Uses archive.org advancedsearch endpoint (JSON) to find image items and extract a candidate file URL.
-    Heuristic: looks for identifiers and uses the /download/{identifier}/ URL pattern.
-    """
-    # Basic advancedsearch: mediatype:image and query terms
-    endpoint = "https://archive.org/advancedsearch.php"
-    q = f'({query}) AND mediatype:image'
-    params = {
-        "q": q,
-        "fl[]": ["identifier", "title"],
-        "rows": min(50, max_images * 10),
-        "page": 1,
-        "output": "json",
-    }
-    r = SESSION.get(endpoint, params=params, timeout=30)
+def _html_fallback_scrape_commons(query: str, rng: random.Random) -> List[str]:
+    q = requests.utils.quote(query)
+    url = f"https://commons.wikimedia.org/w/index.php?search={q}&title=Special:MediaSearch&type=image"
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=35)
     r.raise_for_status()
-    data = r.json()
-    docs = (((data.get("response") or {}).get("docs")) or [])
-    random.shuffle(docs)
+    soup = BeautifulSoup(r.text, "html.parser")
+    links = []
+    for a in soup.select("a.sdms-image-result__thumbnail-link, a.mw-file-description"):
+        href = a.get("href") or ""
+        if href.startswith("/wiki/"):
+            links.append("https://commons.wikimedia.org" + href)
+    rng.shuffle(links)
+    return links[:18]
 
-    assets: List[ImageAsset] = []
-    for d in docs:
-        ident = d.get("identifier")
-        title = d.get("title") or ident or "archive_item"
-        if not ident:
+
+def scrape_images(cfg: ScrapeConfig) -> List[str]:
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    rng = random.Random(cfg.seed)
+
+    keywords = pick_keywords(cfg.seed)
+    query = " ".join(keywords)
+
+    images: List[str] = []
+    seen_urls = set()
+
+    try:
+        results = _wikimedia_search_images(query, limit=max(cfg.max_images * 3, 20), rng=rng)
+    except Exception:
+        results = []
+
+    if not results:
+        try:
+            pages = _html_fallback_scrape_commons(query, rng=rng)
+            titles = []
+            for p in pages:
+                m = re.search(r"/wiki/(File:[^?#]+)", p)
+                if m:
+                    titles.append(requests.utils.unquote(m.group(1)))
+            if titles:
+                params = {
+                    "action": "query",
+                    "format": "json",
+                    "titles": "|".join(titles[:25]),
+                    "prop": "imageinfo",
+                    "iiprop": "url|size|mime",
+                    "iiurlwidth": "1600",
+                }
+                rr = requests.get(WIKI_API, params=params, headers={"User-Agent": UA}, timeout=35)
+                rr.raise_for_status()
+                data = rr.json()
+                pages2 = (data.get("query", {}) or {}).get("pages", {}) or {}
+                for _pid, page in pages2.items():
+                    iis = (page.get("imageinfo") or [])
+                    if iis:
+                        ii = iis[0]
+                        url = ii.get("url")
+                        if url:
+                            results.append({
+                                "title": page.get("title", ""),
+                                "url": url,
+                                "width": ii.get("width", 0),
+                                "height": ii.get("height", 0),
+                                "mime": ii.get("mime", ""),
+                            })
+                rng.shuffle(results)
+        except Exception:
+            results = []
+
+    for item in results:
+        if len(images) >= cfg.max_images:
+            break
+        url = item.get("url", "")
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        w, h = int(item.get("width") or 0), int(item.get("height") or 0)
+        if w < cfg.min_width or h < cfg.min_height:
             continue
 
-        # This points to a directory listing; we’ll download via requests and pick the first suitable image later.
-        url = f"https://archive.org/download/{ident}/"
-        assets.append(ImageAsset(url=url, source="Archive.org", title=str(title), license_hint="(check item page)"))
+        ext = os.path.splitext(url.split("?")[0])[1].lower()
+        if ext not in cfg.allow_extensions:
+            continue
 
-        if len(assets) >= max_images:
-            break
-    return assets
+        fn = _safe_filename(item.get("title") or hashlib.sha1(url.encode()).hexdigest()) + ext
+        dst = os.path.join(cfg.out_dir, fn)
+        if _download(url, dst):
+            images.append(dst)
 
+        time.sleep(0.1 + rng.random() * 0.15)
 
-def resolve_archive_download_dir(download_dir_url: str) -> Optional[str]:
-    """
-    Given https://archive.org/download/{identifier}/
-    tries to find a direct .jpg/.png file link by parsing the directory listing HTML.
-    """
-    try:
-        r = SESSION.get(download_dir_url, timeout=30)
-        r.raise_for_status()
-        html = r.text
-    except Exception:
-        return None
-
-    # crude href parse (keeps dependencies minimal; bs4 would also work)
-    hrefs = re.findall(r'href="([^"]+)"', html, flags=re.IGNORECASE)
-    candidates = []
-    for h in hrefs:
-        if h.lower().endswith((".jpg", ".jpeg", ".png", ".webp")) and not h.startswith("?"):
-            candidates.append(h)
-
-    if not candidates:
-        return None
-
-    pick = random.choice(candidates)
-    if pick.startswith("http"):
-        return pick
-    return download_dir_url.rstrip("/") + "/" + pick.lstrip("/")
+    return images
 
 
-def pick_rss_headline(seed: Optional[int] = None) -> str:
-    rnd = random.Random(seed)
-    feed_url = rnd.choice(RSS_FEEDS)
-    try:
-        d = feedparser.parse(feed_url)
-        if not d.entries:
-            return "Local services resume after minor disruption."
-        e = rnd.choice(d.entries[: min(25, len(d.entries))])
-        title = getattr(e, "title", None) or "Routine update issued by authorities."
-        return re.sub(r"\s+", " ", title).strip()
-    except Exception:
-        return "Routine update issued by authorities."
+def fetch_normal_headline(seed: Optional[int] = None) -> str:
+    rng = random.Random(seed)
+    sources = RSS_SOURCES[:]
+    rng.shuffle(sources)
+    for src in sources:
+        try:
+            feed = feedparser.parse(src)
+            if feed and feed.entries:
+                entry = rng.choice(feed.entries[: min(15, len(feed.entries))])
+                title = (entry.get("title") or "").strip()
+                if title:
+                    return re.sub(r"\s+", " ", title)
+        except Exception:
+            continue
+    return "Local news update: nothing unusual reported."
