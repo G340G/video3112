@@ -1,7 +1,7 @@
 """
 scraper.py
-- Scrape public-domain / openly-licensed images (Wikimedia Commons) based on randomized keywords.
-- Also pulls one "normal" RSS headline (for the weird element).
+- Scrape images from Wikimedia Commons (robust: uses thumb JPGs via `thumburl`)
+- Pull a "normal" RSS headline (weird element)
 """
 from __future__ import annotations
 
@@ -17,10 +17,8 @@ import requests
 from bs4 import BeautifulSoup
 import feedparser
 
-
 WIKI_API = "https://commons.wikimedia.org/w/api.php"
-UA = "AnalogHorrorBot/1.0 (GitHub Actions; educational)"
-
+UA = "AnalogHorrorBot/1.2 (GitHub Actions; educational)"
 
 KEYWORDS_LIMINAL = [
     "liminal space", "empty hallway", "abandoned office", "fluorescent corridor",
@@ -44,15 +42,18 @@ RSS_SOURCES = [
     "https://www.reuters.com/rssFeed/topNews",
 ]
 
-
 @dataclass
 class ScrapeConfig:
     out_dir: str
     max_images: int = 14
-    min_width: int = 960
-    min_height: int = 720
+    min_width: int = 640
+    min_height: int = 480
+    # We mostly download thumbnails (jpg) so keep it permissive
     allow_extensions: Tuple[str, ...] = (".jpg", ".jpeg", ".png")
     seed: Optional[int] = None
+    # robustness
+    tries: int = 5
+    polite_sleep: Tuple[float, float] = (0.08, 0.18)
 
 
 def pick_keywords(seed: Optional[int] = None) -> List[str]:
@@ -67,8 +68,8 @@ def pick_keywords(seed: Optional[int] = None) -> List[str]:
             kws.append(rng.choice(pools[1]))
         else:
             kws.append(rng.choice(pools[2]))
-    if rng.random() < 0.5:
-        kws.append(rng.choice(["archive", "photograph", "1990", "security", "empty"]))
+    if rng.random() < 0.6:
+        kws.append(rng.choice(["archive", "photograph", "1990", "security", "empty", "indoor"]))
     out = []
     for k in kws:
         if k not in out:
@@ -89,12 +90,15 @@ def _download(url: str, dst: str, timeout: int = 35) -> bool:
             for chunk in r.iter_content(chunk_size=1024 * 256):
                 if chunk:
                     f.write(chunk)
-        return os.path.getsize(dst) > 10_000
+        return os.path.getsize(dst) > 12_000
     except Exception:
         return False
 
 
 def _wikimedia_search_images(query: str, limit: int, rng: random.Random) -> List[dict]:
+    """
+    Uses Wikimedia Commons API with thumb URLs (more reliable than original files).
+    """
     params = {
         "action": "query",
         "format": "json",
@@ -102,7 +106,8 @@ def _wikimedia_search_images(query: str, limit: int, rng: random.Random) -> List
         "gsrsearch": f"filetype:bitmap {query}",
         "gsrlimit": str(limit),
         "prop": "imageinfo",
-        "iiprop": "url|size|mime",
+        # request thumburl as well
+        "iiprop": "url|size|mime|thumburl",
         "iiurlwidth": "1600",
     }
     r = requests.get(WIKI_API, params=params, headers={"User-Agent": UA}, timeout=35)
@@ -115,14 +120,14 @@ def _wikimedia_search_images(query: str, limit: int, rng: random.Random) -> List
         if not iis:
             continue
         ii = iis[0]
-        url = ii.get("url")
+        url = ii.get("thumburl") or ii.get("url")  # prefer thumb (jpg)
         if not url:
             continue
         results.append({
             "title": page.get("title", ""),
             "url": url,
-            "width": ii.get("width", 0),
-            "height": ii.get("height", 0),
+            "width": int(ii.get("width") or 0),
+            "height": int(ii.get("height") or 0),
             "mime": ii.get("mime", ""),
         })
     rng.shuffle(results)
@@ -141,84 +146,105 @@ def _html_fallback_scrape_commons(query: str, rng: random.Random) -> List[str]:
         if href.startswith("/wiki/"):
             links.append("https://commons.wikimedia.org" + href)
     rng.shuffle(links)
-    return links[:18]
+    return links[:24]
+
+
+def _relax_dimensions(min_w: int, min_h: int, step: int) -> Tuple[int, int]:
+    # progressively lower constraints but keep usable
+    w = max(480, min_w - step * 120)
+    h = max(360, min_h - step * 90)
+    return w, h
 
 
 def scrape_images(cfg: ScrapeConfig) -> List[str]:
     os.makedirs(cfg.out_dir, exist_ok=True)
     rng = random.Random(cfg.seed)
 
-    keywords = pick_keywords(cfg.seed)
-    query = " ".join(keywords)
-
     images: List[str] = []
     seen_urls = set()
 
-    try:
-        results = _wikimedia_search_images(query, limit=max(cfg.max_images * 3, 20), rng=rng)
-    except Exception:
-        results = []
+    for attempt in range(cfg.tries):
+        # change query each attempt
+        kw = pick_keywords((cfg.seed or 0) + attempt * 99991)
+        query = " ".join(kw)
 
-    if not results:
+        # relax minimum size progressively
+        min_w, min_h = _relax_dimensions(cfg.min_width, cfg.min_height, attempt)
+
         try:
-            pages = _html_fallback_scrape_commons(query, rng=rng)
-            titles = []
-            for p in pages:
-                m = re.search(r"/wiki/(File:[^?#]+)", p)
-                if m:
-                    titles.append(requests.utils.unquote(m.group(1)))
-            if titles:
-                params = {
-                    "action": "query",
-                    "format": "json",
-                    "titles": "|".join(titles[:25]),
-                    "prop": "imageinfo",
-                    "iiprop": "url|size|mime",
-                    "iiurlwidth": "1600",
-                }
-                rr = requests.get(WIKI_API, params=params, headers={"User-Agent": UA}, timeout=35)
-                rr.raise_for_status()
-                data = rr.json()
-                pages2 = (data.get("query", {}) or {}).get("pages", {}) or {}
-                for _pid, page in pages2.items():
-                    iis = (page.get("imageinfo") or [])
-                    if iis:
+            results = _wikimedia_search_images(query, limit=max(cfg.max_images * 4, 40), rng=rng)
+        except Exception:
+            results = []
+
+        # fallback HTML -> titles -> re-query API (thumburl)
+        if not results:
+            try:
+                pages = _html_fallback_scrape_commons(query, rng=rng)
+                titles = []
+                for p in pages:
+                    m = re.search(r"/wiki/(File:[^?#]+)", p)
+                    if m:
+                        titles.append(requests.utils.unquote(m.group(1)))
+                if titles:
+                    params = {
+                        "action": "query",
+                        "format": "json",
+                        "titles": "|".join(titles[:40]),
+                        "prop": "imageinfo",
+                        "iiprop": "url|size|mime|thumburl",
+                        "iiurlwidth": "1600",
+                    }
+                    rr = requests.get(WIKI_API, params=params, headers={"User-Agent": UA}, timeout=35)
+                    rr.raise_for_status()
+                    data = rr.json()
+                    pages2 = (data.get("query", {}) or {}).get("pages", {}) or {}
+                    for _pid, page in pages2.items():
+                        iis = (page.get("imageinfo") or [])
+                        if not iis:
+                            continue
                         ii = iis[0]
-                        url = ii.get("url")
+                        url = ii.get("thumburl") or ii.get("url")
                         if url:
                             results.append({
                                 "title": page.get("title", ""),
                                 "url": url,
-                                "width": ii.get("width", 0),
-                                "height": ii.get("height", 0),
+                                "width": int(ii.get("width") or 0),
+                                "height": int(ii.get("height") or 0),
                                 "mime": ii.get("mime", ""),
                             })
-                rng.shuffle(results)
-        except Exception:
-            results = []
+                    rng.shuffle(results)
+            except Exception:
+                results = []
 
-    for item in results:
-        if len(images) >= cfg.max_images:
-            break
-        url = item.get("url", "")
-        if not url or url in seen_urls:
-            continue
-        seen_urls.add(url)
+        for item in results:
+            if len(images) >= cfg.max_images:
+                return images
 
-        w, h = int(item.get("width") or 0), int(item.get("height") or 0)
-        if w < cfg.min_width or h < cfg.min_height:
-            continue
+            url = item.get("url", "")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
 
-        ext = os.path.splitext(url.split("?")[0])[1].lower()
-        if ext not in cfg.allow_extensions:
-            continue
+            w, h = int(item.get("width") or 0), int(item.get("height") or 0)
+            # size check is on original metadata; thumbs are usually fine anyway
+            if w and h and (w < min_w or h < min_h):
+                continue
 
-        fn = _safe_filename(item.get("title") or hashlib.sha1(url.encode()).hexdigest()) + ext
-        dst = os.path.join(cfg.out_dir, fn)
-        if _download(url, dst):
-            images.append(dst)
+            ext = os.path.splitext(url.split("?")[0])[1].lower()
+            if ext not in cfg.allow_extensions:
+                # thumburl is typically jpg; but keep safe
+                ext = ".jpg"
 
-        time.sleep(0.1 + rng.random() * 0.15)
+            title = item.get("title") or hashlib.sha1(url.encode()).hexdigest()
+            fn = _safe_filename(title) + ext
+            dst = os.path.join(cfg.out_dir, fn)
+
+            if _download(url, dst):
+                images.append(dst)
+
+            time.sleep(cfg.polite_sleep[0] + rng.random() * (cfg.polite_sleep[1] - cfg.polite_sleep[0]))
+
+        # next attempt will try a new query and relax sizes more
 
     return images
 
@@ -238,3 +264,4 @@ def fetch_normal_headline(seed: Optional[int] = None) -> str:
         except Exception:
             continue
     return "Local news update: nothing unusual reported."
+
